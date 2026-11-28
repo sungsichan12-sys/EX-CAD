@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: 2026 EX-CAD Authors
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-import json
 import math
 import os
 
@@ -85,14 +84,72 @@ def get_polyhedron_faces(poly_type: str = 'DODECAHEDRON_12') -> list[dict]:
     return faces
 
 
-def _get_or_create_collection(name: str):
-    col = bpy.data.collections.get(name)
-    if col is None:
-        col = bpy.data.collections.new(name)
-        bpy.context.scene.collection.children.link(col)
-    for obj in list(col.objects):
-        bpy.data.objects.remove(obj, do_unlink=True)
-    return col
+def _configure_camera(data, size):
+    data.type = 'ORTHO'
+    data.ortho_scale = size
+    data.clip_start = min(0.01, size * 0.01)
+    data.clip_end = max(0.1, size * 10)
+    return data
+
+
+def _view_matrix(face, center, size):
+    right, up, normal = (Vector(face[k]) for k in ("right", "up", "normal"))
+    matrix = Matrix((right, up, normal)).transposed().to_4x4()
+    matrix.translation = Vector(center) + normal * (size * 1.15)
+    return matrix
+
+
+def _rig_index(obj):
+    if obj.type != 'CAMERA':
+        return None
+    if "excad_view_index" in obj:
+        return obj["excad_view_index"]
+    # Recognize the untagged orthographic cameras made by earlier releases.
+    name = obj.name.partition(".")[0]
+    if (name.startswith("EXCAD_Cam_") and name[10:].isdecimal() and obj.data.type == 'ORTHO'
+            and obj.data.name.partition(".")[0] == name):
+        return int(name[10:])
+    return None
+
+
+def _is_cage(obj):
+    return obj.type == 'MESH' and (obj.get("excad_view_cage") or (
+        obj.display_type == 'WIRE' and obj.name.partition(".")[0] == "EXCAD_Poly_Cage"
+        and obj.data.name.partition(".")[0] == "EXCAD_Poly_Cage"
+    ))
+
+
+def _validate_frame(size, center):
+    if not math.isfinite(size) or size <= 0 or np.shape(center) != (3,) or not np.isfinite(center).all():
+        raise ValueError("Provide a finite projection center and positive size")
+
+
+def _rig_collection(scene):
+    collection = next((c for c in scene.collection.children if c.get("excad_poly_rig")), None)
+    if collection is None:
+        collection = scene.collection.children.get("EXCAD_Polyhedron_Rig")
+    if collection is None:
+        collection = bpy.data.collections.new("EXCAD_Polyhedron_Rig")
+        scene.collection.children.link(collection)
+    elif any(collection in other.collection.children_recursive for other in bpy.data.scenes if other != scene):
+        # A linked scene can share the entire collection. Isolate just its generated
+        # cameras and cage while preserving objects the user added to the rig.
+        local = collection.copy()
+        for obj in collection.objects:
+            if _rig_index(obj) is not None or _is_cage(obj):
+                copy = obj.copy()
+                local.objects.unlink(obj)
+                local.objects.link(copy)
+                if scene.camera == obj:
+                    scene.camera = copy
+                for marker in scene.timeline_markers:
+                    if marker.camera == obj:
+                        marker.camera = copy
+        scene.collection.children.link(local)
+        scene.collection.children.unlink(collection)
+        collection = local
+    collection["excad_poly_rig"] = True
+    return collection
 
 
 def create_polyhedron_rig(
@@ -101,110 +158,81 @@ def create_polyhedron_rig(
     center: tuple[float, float, float] = (0.0, 0.0, 0.9),
     output_dir: str = "",
 ):
+    _validate_frame(size, center)
     faces = get_polyhedron_faces(poly_type)
-    col = _get_or_create_collection("EXCAD_Polyhedron_Rig")
-    cx, cy, cz = center
-    cam_dist = float(size) * 1.15
-
-    # Wireframe bounding cage
+    collection = _rig_collection(bpy.context.scene)
+    cage = next((o for o in collection.objects if _is_cage(o)), None)
+    if cage is None:
+        mesh = bpy.data.meshes.new("EXCAD_Poly_Cage")
+        cage = bpy.data.objects.new("EXCAD_Poly_Cage", mesh)
+        collection.objects.link(cage)
+    elif cage.data.users > 1:
+        cage.data = cage.data.copy()
+    cage["excad_view_cage"] = True
+    cage.location = center
+    cage.display_type = 'WIRE'
+    cage.hide_render = True
     bm = bmesh.new()
-    if poly_type == 'CUBE_6':
-        bmesh.ops.create_cube(bm, size=float(size))
-    else:
-        subdiv = 1 if poly_type == 'OCTAHEDRON_8' else 2
-        bmesh.ops.create_icosphere(bm, subdivisions=subdiv, radius=float(size) * 0.55)
-    cage_mesh = bpy.data.meshes.new("EXCAD_Poly_Cage")
-    bm.to_mesh(cage_mesh)
-    bm.free()
-    cage_obj = bpy.data.objects.new("EXCAD_Poly_Cage", cage_mesh)
-    cage_obj.location = center
-    cage_obj.display_type = 'WIRE'
-    col.objects.link(cage_obj)
-
-    cam_objs = []
-    for f in faces:
-        n = f["normal"]
-        r = f["right"]
-        u = f["up"]
-        cam_data = bpy.data.cameras.new(f"EXCAD_Cam_{f['index']:02d}")
-        cam_data.type = 'ORTHO'
-        cam_data.ortho_scale = float(size)
-        cam_data.clip_start = 0.01
-        cam_data.clip_end = float(size) * 10.0
-
-        cam_obj = bpy.data.objects.new(f"EXCAD_Cam_{f['index']:02d}", cam_data)
-        mat = Matrix((
-            (r[0], u[0], n[0], cx + n[0] * cam_dist),
-            (r[1], u[1], n[1], cy + n[1] * cam_dist),
-            (r[2], u[2], n[2], cz + n[2] * cam_dist),
-            (0.0, 0.0, 0.0, 1.0),
-        ))
-        cam_obj.matrix_world = mat
-        col.objects.link(cam_obj)
-        cam_objs.append(cam_obj)
-
-    manifest_path = ""
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        manifest_path = os.path.join(output_dir, "views_manifest.json")
-        with open(manifest_path, "w", encoding="utf-8") as fp:
-            json.dump({
-                "poly_type": poly_type,
-                "size": float(size),
-                "center": list(center),
-                "views": faces,
-            }, fp, indent=2)
-
-    return faces, cam_objs, manifest_path
-
-
-def render_polyhedron_views(
-    poly_type: str,
-    output_dir: str,
-    size: float = 2.0,
-    center: tuple[float, float, float] = (0.0, 0.0, 0.9),
-    img_res: int = 256,
-):
-    faces, cam_objs, manifest_path = create_polyhedron_rig(poly_type, size, center, output_dir)
-    scene = bpy.context.scene
-    prev_cam = scene.camera
-    prev_res_x = scene.render.resolution_x
-    prev_res_y = scene.render.resolution_y
-    prev_pct = scene.render.resolution_percentage
-    prev_trans = scene.render.film_transparent
-    prev_filepath = scene.render.filepath
-
     try:
-        scene.render.resolution_x = int(img_res)
-        scene.render.resolution_y = int(img_res)
-        scene.render.resolution_percentage = 100
-        scene.render.film_transparent = True
-        scene.render.image_settings.file_format = 'PNG'
-        scene.render.image_settings.color_mode = 'RGBA'
-
-        rendered = []
-        for f, cam_obj in zip(faces, cam_objs):
-            out_path = os.path.join(output_dir, f["filename"])
-            scene.camera = cam_obj
-            scene.render.filepath = out_path
-            bpy.ops.render.render(write_still=True)
-            rendered.append(out_path)
-        return rendered, manifest_path
+        if poly_type == 'CUBE_6':
+            bmesh.ops.create_cube(bm, size=size)
+        else:
+            dual = {"OCTAHEDRON_8": "CUBE_6", "DODECAHEDRON_12": "ICOSAHEDRON_20", "ICOSAHEDRON_20": "DODECAHEDRON_12"}
+            vertices = [bm.verts.new(Vector(n) * (size * 0.55)) for n in _raw_face_normals(dual[poly_type])]
+            bmesh.ops.convex_hull(bm, input=vertices)
+            bm.normal_update()
+            bmesh.ops.dissolve_limit(bm, angle_limit=0.005, verts=bm.verts[:], edges=bm.edges[:])
+        bm.to_mesh(cage.data)
     finally:
-        scene.camera = prev_cam
-        scene.render.resolution_x = prev_res_x
-        scene.render.resolution_y = prev_res_y
-        scene.render.resolution_percentage = prev_pct
-        scene.render.film_transparent = prev_trans
-        scene.render.filepath = prev_filepath
+        bm.free()
+
+    cameras = {i: obj for obj in collection.objects if (i := _rig_index(obj)) is not None}
+    result = []
+    for face in faces:
+        index = face["index"]
+        camera = cameras.pop(index, None)
+        if camera is None:
+            name = f"EXCAD_Cam_{index:02d}"
+            camera = bpy.data.objects.new(name, bpy.data.cameras.new(name))
+            collection.objects.link(camera)
+        elif camera.data.users > 1:
+            camera.data = camera.data.copy()
+        _configure_camera(camera.data, size)
+        camera["excad_view_index"] = index
+        camera.matrix_world = _view_matrix(face, center, size)
+        result.append(camera)
+    for unused in cameras.values():
+        # Preserve a user's active camera, external links and animation references.
+        if unused.users == 1:
+            data = unused.data
+            bpy.data.objects.remove(unused, do_unlink=True)
+            if data.users == 0:
+                bpy.data.cameras.remove(data)
+    manifest = ""
+    if output_dir:
+        from .view_capture import write_manifest
+        manifest = str(write_manifest(bpy.path.abspath(output_dir), poly_type, size, center, faces))
+    return faces, result, manifest
+
+
+def render_polyhedron_views(poly_type, output_dir, size=2.0, center=(0.0, 0.0, 0.9), img_res=256, write_depth=False):
+    from .view_capture import capture
+
+    return capture(poly_type, output_dir, size, center, img_res, write_depth)
 
 
 def _load_rgba_and_mask(image_path: str, threshold: float = 0.15):
-    existing = set(bpy.data.images.keys())
-    img = bpy.data.images.load(image_path, check_existing=True)
-    w, h = img.size[0], img.size[1]
-    arr = np.array(img.pixels[:], dtype=np.float32).reshape((h, w, 4))
-    if img.name not in existing:
+    from .image_colors import has_srgb_bytes, srgb_to_linear
+
+    img = bpy.data.images.load(image_path, check_existing=False)
+    try:
+        w, h = img.size
+        if w == 0 or h == 0:
+            raise ValueError(f"Empty projection image: {image_path}")
+        arr = np.empty((h, w, 4), dtype=np.float32)
+        img.pixels.foreach_get(arr.ravel())
+        encoded = has_srgb_bytes(img)
+    finally:
         bpy.data.images.remove(img)
 
     alpha = arr[:, :, 3]
@@ -217,45 +245,8 @@ def _load_rgba_and_mask(image_path: str, threshold: float = 0.15):
         bg = np.median(border_rgb, axis=0)
         dist = np.linalg.norm(rgb - bg[None, None, :], axis=2)
         mask = dist > float(threshold)
-    return arr[:, :, :3], mask
-
-
-def _extract_voxel_surface_bmesh(inside: np.ndarray, origin: tuple[float, float, float], step: float) -> bmesh.types.BMesh:
-    nx, ny, nz = inside.shape
-    bm = bmesh.new()
-    vgrid = np.full((nx + 1, ny + 1, nz + 1), -1, dtype=np.int32)
-    bm_verts = []
-
-    def get_v(ix: int, iy: int, iz: int):
-        vid = vgrid[ix, iy, iz]
-        if vid < 0:
-            vid = len(bm_verts)
-            bm_verts.append(bm.verts.new((origin[0] + ix * step, origin[1] + iy * step, origin[2] + iz * step)))
-            vgrid[ix, iy, iz] = vid
-        return bm_verts[vid]
-
-    def emit_quads(cond, corners_fn):
-        xs, ys, zs = np.where(cond)
-        for x, y, z in zip(xs.tolist(), ys.tolist(), zs.tolist()):
-            c0, c1, c2, c3 = corners_fn(x, y, z)
-            try:
-                bm.faces.new((get_v(*c0), get_v(*c1), get_v(*c2), get_v(*c3)))
-            except ValueError:
-                pass
-
-    p = np.pad(inside, 1, mode='constant', constant_values=False)
-    # +X, -X
-    emit_quads(inside & ~p[2:, 1:-1, 1:-1], lambda x, y, z: ((x + 1, y, z), (x + 1, y + 1, z), (x + 1, y + 1, z + 1), (x + 1, y, z + 1)))
-    emit_quads(inside & ~p[:-2, 1:-1, 1:-1], lambda x, y, z: ((x, y, z), (x, y, z + 1), (x, y + 1, z + 1), (x, y + 1, z)))
-    # +Y, -Y
-    emit_quads(inside & ~p[1:-1, 2:, 1:-1], lambda x, y, z: ((x, y + 1, z), (x, y + 1, z + 1), (x + 1, y + 1, z + 1), (x + 1, y + 1, z)))
-    emit_quads(inside & ~p[1:-1, :-2, 1:-1], lambda x, y, z: ((x, y, z), (x + 1, y, z), (x + 1, y, z + 1), (x, y, z + 1)))
-    # +Z, -Z
-    emit_quads(inside & ~p[1:-1, 1:-1, 2:], lambda x, y, z: ((x, y, z + 1), (x + 1, y, z + 1), (x + 1, y + 1, z + 1), (x, y + 1, z + 1)))
-    emit_quads(inside & ~p[1:-1, 1:-1, :-2], lambda x, y, z: ((x, y, z), (x, y + 1, z), (x + 1, y + 1, z), (x + 1, y, z)))
-
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-    return bm
+    rgb = arr[:, :, :3]
+    return (srgb_to_linear(rgb) if encoded else rgb), mask
 
 
 def project_colors_to_mesh(
@@ -266,6 +257,8 @@ def project_colors_to_mesh(
     center: tuple[float, float, float] = (0.0, 0.0, 0.9),
     threshold: float = 0.15,
 ) -> int:
+    from .view_fusion import image_coordinates
+
     faces = get_polyhedron_faces(poly_type)
     views = []
     for f in faces:
@@ -292,7 +285,7 @@ def project_colors_to_mesh(
     local_no = np.empty(n_verts * 3, dtype=np.float32)
     mesh.vertices.foreach_get("normal", local_no)
     local_no = local_no.reshape((n_verts, 3))
-    world_no = local_no @ rot_mat.T
+    world_no = local_no @ np.linalg.pinv(rot_mat)
     norms = np.linalg.norm(world_no, axis=1, keepdims=True)
     world_no = world_no / np.maximum(norms, 1e-8)
 
@@ -303,14 +296,9 @@ def project_colors_to_mesh(
     for f, rgb, mask in views:
         h, w, _ = rgb.shape
         n_vec = np.array(f["normal"], dtype=np.float32)
-        r_vec = np.array(f["right"], dtype=np.float32)
-        u_vec = np.array(f["up"], dtype=np.float32)
-
         facing = world_no @ n_vec
-        du = rel @ r_vec
-        dv = rel @ u_vec
-        px = np.rint((du / float(size) + 0.5) * (w - 1)).astype(np.int32)
-        py = np.rint((dv / float(size) + 0.5) * (h - 1)).astype(np.int32)
+        px, py = image_coordinates(rel, f, size, w, h)
+        px, py = np.rint(px).astype(np.int32), np.rint(py).astype(np.int32)
 
         valid = (facing > 0.05) & (px >= 0) & (px < w) & (py >= 0) & (py < h)
         idx = np.where(valid)[0]
@@ -320,7 +308,7 @@ def project_colors_to_mesh(
         idx = idx[m_hits]
         if len(idx) == 0:
             continue
-        weights = (facing[idx] ** 2)
+        weights = (facing[idx] ** 3)
         accum_rgb[idx] += rgb[py[idx], px[idx]] * weights[:, None]
         accum_w[idx] += weights
 
@@ -362,68 +350,80 @@ def reconstruct_from_polyhedron_views(
     smooth_iters: int = 4,
     project_colors: bool = True,
     name: str = "EXCAD_PolyMesh",
+    use_depth: bool = True,
+    texture_mode: str = "UV",
+    texture_size: int = 2048,
 ):
-    faces = get_polyhedron_faces(poly_type)
+    if bpy.context.mode != "OBJECT" or not np.isfinite(size) or size <= 0:
+        raise ValueError("Reconstruction needs a positive size in Object Mode")
+    if texture_mode.upper() not in {"UV", "VERTEX"}:
+        raise ValueError("Use UV or VERTEX texture mode")
+    from .feature_tree import _solid
+    from .uv_bake import read_depth
+    from .view_fusion import fuse
+
+    if np.shape(center) != (3,) or not np.isfinite(center).all():
+        raise ValueError("Provide a finite three-dimensional projection center")
+    image_dir = bpy.path.abspath(image_dir)
     views = []
-    for f in faces:
-        fpath = os.path.join(image_dir, f["filename"])
-        if os.path.isfile(fpath):
-            rgb, mask = _load_rgba_and_mask(fpath, threshold=threshold)
-            views.append((f, rgb, mask))
+    for face in get_polyhedron_faces(poly_type):
+        color_file = os.path.join(image_dir, face["filename"])
+        if os.path.isfile(color_file):
+            _, mask = _load_rgba_and_mask(color_file, threshold=threshold)
+            depth_file = os.path.splitext(color_file)[0] + "_depth.png"
+            depth = read_depth(depth_file) if use_depth and os.path.isfile(depth_file) else None
+            if depth is not None and depth.shape != mask.shape:
+                raise ValueError("Depth and color view dimensions must match")
+            views.append((face, mask, depth))
     if not views:
-        raise FileNotFoundError(f"No face_00.png .. face_{len(faces)-1:02d}.png found in {image_dir}")
+        raise FileNotFoundError(f"No face_XX.png files found in {image_dir}")
 
     res = max(16, min(112, int(resolution)))
-    half = 0.5 * float(size)
-    step = float(size) / res
-    coords = np.linspace(-half + 0.5 * step, half - 0.5 * step, res, dtype=np.float32)
-    gx, gy, gz = np.meshgrid(coords, coords, coords, indexing='ij')
-    rel = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
-
-    inside = np.ones(rel.shape[0], dtype=bool)
-    for f, _, mask in views:
-        h, w = mask.shape
-        r_vec = np.array(f["right"], dtype=np.float32)
-        u_vec = np.array(f["up"], dtype=np.float32)
-        du = rel @ r_vec
-        dv = rel @ u_vec
-        px = np.rint((du / float(size) + 0.5) * (w - 1)).astype(np.int32)
-        py = np.rint((dv / float(size) + 0.5) * (h - 1)).astype(np.int32)
-        in_bounds = (px >= 0) & (px < w) & (py >= 0) & (py < h)
-        sampled = np.zeros(rel.shape[0], dtype=bool)
-        sampled[in_bounds] = mask[py[in_bounds], px[in_bounds]]
-        inside &= sampled
-
-    inside_3d = inside.reshape((res, res, res))
-    if not np.any(inside_3d):
-        raise RuntimeError("Visual Hull intersection is empty; check background threshold or image alignment")
-
-    origin = (center[0] - half, center[1] - half, center[2] - half)
-    bm = _extract_voxel_surface_bmesh(inside_3d, origin, step)
+    points, polygons = fuse(views, size, center, res)
+    selected = list(bpy.context.selected_objects)
+    active = bpy.context.view_layer.objects.active
     mesh = bpy.data.meshes.new(name)
-    bm.to_mesh(mesh)
-    bm.free()
+    obj = None
+    try:
+        mesh.from_pydata(points, [], polygons)
+        mesh.update()
+        obj = bpy.data.objects.new(name, mesh)
+        bpy.context.collection.objects.link(obj)
+        for other in selected:
+            other.select_set(False)
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        try:
+            _solid(mesh)
+        except ValueError:
+            # Ambiguous sign changes can connect components at a single vertex.
+            # Let Blender resolve their topology without voxelizing every smooth surface.
+            mesh.remesh_voxel_size = size / res * 0.85
+            if "FINISHED" not in bpy.ops.object.voxel_remesh():
+                raise ValueError("Voxel remeshing produced no surface")
+            _solid(obj.data)
 
-    obj = bpy.data.objects.new(name, mesh)
-    bpy.context.collection.objects.link(obj)
-    for o in bpy.context.selected_objects:
-        o.select_set(False)
-    obj.select_set(True)
-    bpy.context.view_layer.objects.active = obj
+        if smooth_iters > 0:
+            mod = obj.modifiers.new("EXCAD_Smooth", 'SMOOTH')
+            mod.factor = 0.5
+            mod.iterations = int(smooth_iters)
+            bpy.ops.object.modifier_apply(modifier=mod.name)
 
-    obj.data.remesh_voxel_size = max(0.008, step * 1.15)
-    bpy.ops.object.voxel_remesh()
+        for poly in obj.data.polygons:
+            poly.use_smooth = True
 
-    if smooth_iters > 0:
-        mod = obj.modifiers.new("EXCAD_Smooth", 'SMOOTH')
-        mod.factor = 0.5
-        mod.iterations = int(smooth_iters)
-        bpy.ops.object.modifier_apply(modifier=mod.name)
-
-    for poly in obj.data.polygons:
-        poly.use_smooth = True
-
-    if project_colors:
-        project_colors_to_mesh(obj, poly_type=poly_type, image_dir=image_dir, size=size, center=center, threshold=threshold)
-
-    return obj, len(views)
+        if project_colors and texture_mode.upper() == "UV":
+            from .uv_bake import bake
+            bake(obj, image_dir, poly_type, center, size, texture_size, threshold=threshold, use_depth=use_depth)
+        elif project_colors:
+            project_colors_to_mesh(obj, poly_type=poly_type, image_dir=image_dir, size=size, center=center, threshold=threshold)
+        return obj, len(views)
+    except Exception:
+        if obj is not None:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+        for other in selected:
+            other.select_set(True)
+        bpy.context.view_layer.objects.active = active
+        raise

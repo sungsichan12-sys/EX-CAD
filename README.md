@@ -13,6 +13,12 @@ motion tracking and video editing.
 
 ![Blender screenshot](https://code.blender.org/wp-content/uploads/2018/12/springrg.jpg "Blender screenshot")
 
+EX-CAD Studio
+-------------
+
+This fork includes a Blender add-on for editable CAD recipes, photo-fitted characters, multiview reconstruction and scene inspection.
+The Windows setup, four MCP tools and reproducible examples are documented in the [EX-CAD guide (한국어)](doc/excad/semantic-modeling.md).
+
 Project Pages
 -------------
 

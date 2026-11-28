@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "sketches": {
+    "plate": {
+      "shapes": [
+        {
+          "type": "RECT",
+          "width": 3,
+          "height": 1.8
+        }
+      ]
+    },
+    "opening": {
+      "support": {
+        "object": "SELF",
+        "face": "TOP"
+      },
+      "shapes": [
+        {
+          "type": "SLOT",
+          "length": 1.78,
+          "width": 0.48
+        }
+      ]
+    }
+  },
+  "features": [
+    {
+      "id": "pad",
+      "type": "EXTRUDE",
+      "sketch": "plate",
+      "depth": 0.65
+    },
+    {
+      "id": "through_slot",
+      "type": "EXTRUDE",
+      "sketch": "opening",
+      "op": "CUT",
+      "depth": -1.2
+    },
+    {
+      "id": "round_rim",
+      "type": "FILLET",
+      "edges": "TOP",
+      "radius": 0.065
+    },
+    {
+      "id": "break_edges",
+      "type": "CHAMFER",
+      "edges": "BOTTOM",
+      "width": 0.035
+    }
+  ]
+}

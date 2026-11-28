@@ -109,8 +109,6 @@ _POSE_EULER_DEG = {
         "thigh_r": (4.0, 0.0, 5.0),
     },
     "WAVE": {
-        "upperarm_r": (0.0, 0.0, 130.0),
-        "forearm_r": (-35.0, 0.0, 20.0),
         "upperarm_l": (5.0, 0.0, -10.0),
         "forearm_l": (-14.0, 0.0, 0.0),
         "head": (-4.0, 0.0, -8.0),
@@ -139,15 +137,49 @@ _POSE_EULER_DEG = {
 }
 
 
-def apply_pose_preset(arm_obj, pose_name: str = 'RELAXED') -> int:
-    if arm_obj is None or arm_obj.type != 'ARMATURE' or not arm_obj.pose:
-        return 0
-    for pb in arm_obj.pose.bones:
-        pb.rotation_mode = 'XYZ'
-        pb.rotation_euler = Euler((0.0, 0.0, 0.0), 'XYZ')
-        pb.location = Vector((0.0, 0.0, 0.0))
+def _raise_waving_hand(arm_obj):
+    """Aim the elbow and wrist in the character's anatomical frame, independent of bone roll."""
 
-    spec = _POSE_EULER_DEG.get(pose_name.upper(), {})
+    def find(role):
+        return next((arm_obj.pose.bones[n] for n in _BONE_ALIASES[role] if n in arm_obj.pose.bones), None)
+
+    right, left, forearm, head = (find(role) for role in ("upperarm_r", "upperarm_l", "forearm_r", "head"))
+    if not all((right, left, forearm, head)):
+        return 0
+    shoulder = right.bone.head_local
+    other = left.bone.head_local
+    outward = (shoulder - other).normalized()
+    up = head.bone.head_local - (shoulder + other) / 2
+    up = (up - outward * up.dot(outward)).normalized()
+    forward = up.cross(outward).normalized()
+    for bone, direction in (
+        (right, outward + 0.40 * up + 0.24 * forward),
+        (forearm, up + 0.07 * outward + 0.18 * forward),
+    ):
+        delta = (bone.tail - bone.head).rotation_difference(direction)
+        pivot = Matrix.Translation(bone.head)
+        bone.matrix = pivot @ delta.to_matrix().to_4x4() @ pivot.inverted() @ bone.matrix
+        bpy.context.view_layer.update()
+    return 2
+
+
+def apply_pose_preset(arm_obj, pose_name: str = "RELAXED") -> int:
+    if arm_obj is None or arm_obj.type != "ARMATURE" or not arm_obj.pose:
+        return 0
+    pose_name = pose_name.upper()
+    if pose_name not in _POSE_EULER_DEG:
+        raise ValueError(f"Unknown pose preset {pose_name}")
+    for pb in arm_obj.pose.bones:
+        pb.rotation_mode = "XYZ"
+        pb.rotation_euler = Euler((0.0, 0.0, 0.0), "XYZ")
+        pb.location = Vector((0.0, 0.0, 0.0))
+        if pose_name == "RESET":
+            pb.scale = (1.0, 1.0, 1.0)
+
+    if pose_name == "RESET":
+        bpy.context.view_layer.update()
+        return len(arm_obj.pose.bones)
+    spec = _POSE_EULER_DEG[pose_name]
     applied = 0
     for role, deg in spec.items():
         for bname in _BONE_ALIASES.get(role, []):
@@ -157,6 +189,8 @@ def apply_pose_preset(arm_obj, pose_name: str = 'RELAXED') -> int:
                 applied += 1
                 break
     bpy.context.view_layer.update()
+    if pose_name == 'WAVE':
+        applied += _raise_waving_hand(arm_obj)
     return applied
 
 

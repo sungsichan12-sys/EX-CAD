@@ -113,7 +113,7 @@ def search_assets(query: str = "", extra_dir: str = "", limit: int = 30) -> list
     return out
 
 
-def import_asset_file(filepath: str, target_basemesh=None) -> list:
+def import_asset_file(filepath: str, target_basemesh=None, *, merge_vertices=False) -> list:
     if not os.path.isfile(filepath):
         raise FileNotFoundError(f"Asset file not found: {filepath}")
 
@@ -121,7 +121,7 @@ def import_asset_file(filepath: str, target_basemesh=None) -> list:
     before = set(bpy.data.objects.keys())
 
     if ext in (".glb", ".gltf"):
-        bpy.ops.import_scene.gltf(filepath=filepath)
+        bpy.ops.import_scene.gltf(filepath=filepath, merge_vertices=merge_vertices)
     elif ext == ".obj":
         bpy.ops.wm.obj_import(filepath=filepath)
     elif ext == ".fbx":
@@ -146,20 +146,19 @@ def import_asset_file(filepath: str, target_basemesh=None) -> list:
     return [bpy.data.objects[n] for n in new_names if n in bpy.data.objects]
 
 
-def _world_bbox(objs):
-    # Exclude custom bone-shape helper meshes so they don't skew character bounds
-    bone_shapes = set()
-    for obj in objs:
-        if obj.type == 'ARMATURE' and obj.pose:
-            for pb in obj.pose.bones:
-                if pb.custom_shape is not None:
-                    bone_shapes.add(pb.custom_shape)
+def bone_shapes(objects):
+    return {bone.custom_shape for obj in objects if obj.type == 'ARMATURE' and obj.pose
+            for bone in obj.pose.bones if bone.custom_shape is not None}
 
+
+def _world_bbox(objs):
+    # Bone shapes are viewport controls, independent of a character's dimensions.
+    controls = bone_shapes(objs)
     mins = [float("inf"), float("inf"), float("inf")]
     maxs = [float("-inf"), float("-inf"), float("-inf")]
     found = False
     for obj in objs:
-        if obj in bone_shapes or obj.type != 'MESH' or not obj.data or len(obj.data.vertices) == 0:
+        if obj in controls or obj.type != 'MESH' or not obj.data or len(obj.data.vertices) == 0:
             continue
         found = True
         mw = obj.matrix_world

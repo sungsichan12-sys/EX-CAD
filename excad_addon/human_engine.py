@@ -194,6 +194,7 @@ def create_studio_human(
         if apply_skin:
             _apply_fallback_skin_material(obj, name)
         rig_obj = auto_rig_any_human_mesh(obj, name=f"{name}.rig") if (rig_name and rig_name != "NONE") else None
+        obj["excad_character"] = True
         return obj, rig_obj, "FALLBACK_SDF"
 
     HumanService, TargetService, MaterialService, _ = mpfb
@@ -258,6 +259,7 @@ def create_studio_human(
             bpy.ops.object.modifier_move_to_index(modifier=m.name, index=0)
             break
 
+    basemesh["excad_character"] = True
     return basemesh, rig_obj, "MPFB2"
 
 
@@ -304,6 +306,8 @@ def apply_morph_target(obj, category: str, target_relpath: str, weight: float = 
     TargetService.load_target(obj, full_path, weight=float(weight), name=target_name)
     if obj.find_armature() is not None:
         HumanService.refit(obj)
+    from .wardrobe import refit_eyes
+    refit_eyes(obj)
     return target_name
 
 
@@ -315,23 +319,21 @@ def refit_human_rig(obj) -> bool:
     if obj is None or obj.find_armature() is None:
         return False
     HumanService.refit(obj)
+    from .wardrobe import refit_eyes
+    refit_eyes(obj)
     return True
 
 
-def auto_rig_any_human_mesh(obj, name: str = "EXCAD_AutoRig"):
-    if obj is None or obj.type != 'MESH':
-        raise ValueError("Target object must be a MESH")
-
-    bpy.context.view_layer.update()
-    corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+def create_humanoid_armature(corners, name):
+    """Place the shared upright skeleton in world space at the scale of the model."""
     xs = [c.x for c in corners]
     ys = [c.y for c in corners]
     zs = [c.z for c in corners]
     cx = 0.5 * (min(xs) + max(xs))
     cy = 0.5 * (min(ys) + max(ys))
     z0 = min(zs)
-    h = max(0.2, max(zs) - z0)
-    w = max(0.1, max(xs) - min(xs))
+    h = max(1e-6, max(zs) - z0)
+    w = max(1e-6, max(xs) - min(xs))
 
     arm_data = bpy.data.armatures.new(name)
     arm_obj = bpy.data.objects.new(name, arm_data)
@@ -377,16 +379,18 @@ def auto_rig_any_human_mesh(obj, name: str = "EXCAD_AutoRig"):
         add_bone(f"foot.{side}", (cx + sx * hip_x, cy + 0.01 * h, z0 + 0.05 * h), (cx + sx * hip_x, cy - 0.09 * h, z0 + 0.02 * h), kn, True)
 
     bpy.ops.object.mode_set(mode='OBJECT')
+    return arm_obj
 
-    for o in bpy.context.selected_objects:
-        o.select_set(False)
-    obj.select_set(True)
-    arm_obj.select_set(True)
-    bpy.context.view_layer.objects.active = arm_obj
-    bpy.ops.object.parent_set(type='ARMATURE_AUTO')
 
-    for m in obj.modifiers:
-        if m.type == 'ARMATURE':
-            m.use_deform_preserve_volume = True
+def auto_rig_any_human_mesh(obj, name: str = "EXCAD_AutoRig"):
+    if obj is None or obj.type != 'MESH':
+        raise ValueError("Target object must be a mesh")
+    if bpy.context.mode != "OBJECT":
+        raise ValueError("Switch to Object Mode before fitting the armature")
+    from .humanoid_skin import bind_heat
 
+    bpy.context.view_layer.update()
+    corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    arm_obj = create_humanoid_armature(corners, name)
+    bind_heat(obj, arm_obj, keep_parent=False)
     return arm_obj

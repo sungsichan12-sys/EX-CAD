@@ -4,27 +4,12 @@
 bl_info = {
     "name": "EX-CAD Studio",
     "author": "EX-CAD Authors",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > EX-CAD",
     "description": "Studio Human Generator (MPFB2), External Git/URL Asset Fetcher, Parametric Sketch, and AI Direct Bridge",
     "category": "3D View",
 }
-
-if "bpy" in locals():
-    import importlib
-    for _mod in (
-        sketch_engine,
-        human_engine,
-        asset_fetcher,
-        image_sketch_engine,
-        polyhedron_engine,
-        oneshot_generators,
-        character_stylizer,
-        city_generator,
-        ai_bridge,
-    ):
-        importlib.reload(_mod)
 
 import bpy
 from bpy.props import (
@@ -148,6 +133,7 @@ class EXCADSceneProps(PropertyGroup):
     poly_dir: StringProperty(name="Views Folder", subtype='DIR_PATH', default="")
     poly_resolution: IntProperty(name="Voxel Res", default=56, min=16, max=112)
     poly_project_color: BoolProperty(name="Project 360° Colors", default=True)
+    poly_write_depth: BoolProperty(name="Capture Depth Maps", default=False)
 
     oneshot_pose: EnumProperty(
         name="Pose",
@@ -198,6 +184,58 @@ class EXCADSceneProps(PropertyGroup):
 # ---------------------------------------------------------------------------
 # Human Operators
 # ---------------------------------------------------------------------------
+
+class EXCAD_OT_install_cc0_assets(Operator):
+    bl_idname = "excad.install_cc0_assets"
+    bl_label = "Install CC0 character assets"
+    _job = None
+
+    @classmethod
+    def poll(cls, context):
+        return cls._job is None
+
+    def execute(self, context):
+        from .human_assets import install_asset_pack
+        from .face_fit import cache_dir
+
+        if bpy.app.background:
+            try:
+                install_asset_pack("all")
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+            return {"FINISHED"}
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="EXCAD assets")
+        type(self)._job = pool.submit(install_asset_pack, "all", cache_dir())
+        pool.shutdown(wait=False)
+        self._timer = context.window_manager.event_timer_add(0.25, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        self.report({"INFO"}, "Downloading the MakeHuman CC0 character packs")
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        job = type(self)._job
+        if event.type != "TIMER" or not job.done():
+            return {"PASS_THROUGH"}
+        context.window_manager.event_timer_remove(self._timer)
+        type(self)._job = None
+        try:
+            path = job.result()
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"MakeHuman eyes, teeth, hair and wardrobe cached in {path}")
+        return {"FINISHED"}
+
+    def cancel(self, context):
+        context.window_manager.event_timer_remove(self._timer)
+        job = type(self)._job
+        if job is not None:
+            job.cancel()
+            type(self)._job = None
+
 
 class EXCAD_OT_human_generate(Operator):
     bl_idname = "excad.human_generate"
@@ -520,9 +558,14 @@ class EXCAD_OT_poly_render_views(Operator):
         if not out_dir:
             self.report({'ERROR'}, "Select a Views Folder first")
             return {'CANCELLED'}
-        rendered, _ = polyhedron_engine.render_polyhedron_views(
-            poly_type=p.poly_type, output_dir=out_dir, size=p.poly_size, center=(0.0, 0.0, p.poly_size * 0.45)
-        )
+        try:
+            rendered, _ = polyhedron_engine.render_polyhedron_views(
+                poly_type=p.poly_type, output_dir=out_dir, size=p.poly_size, center=(0.0, 0.0, p.poly_size * 0.45),
+                write_depth=p.poly_write_depth,
+            )
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
         self.report({'INFO'}, f"Rendered {len(rendered)} views to {out_dir}")
         return {'FINISHED'}
 
@@ -694,6 +737,7 @@ class EXCAD_OT_sketch_new(Operator):
 
     def execute(self, context):
         sketch_engine.SketchDocument.active().reset(self.plane)
+        sketch_engine.SketchDocument.active().save()
         self.report({'INFO'}, f"EX-CAD: Started new {self.plane} sketch")
         return {'FINISHED'}
 
@@ -713,6 +757,7 @@ class EXCAD_OT_sketch_add_rect(Operator):
 
     def execute(self, context):
         sketch_engine.SketchDocument.active().add_rect(self.u0, self.v0, self.width, self.height)
+        sketch_engine.SketchDocument.active().save()
         return {'FINISHED'}
 
 
@@ -730,6 +775,7 @@ class EXCAD_OT_sketch_add_circle(Operator):
 
     def execute(self, context):
         sketch_engine.SketchDocument.active().add_circle(self.cu, self.cv, self.radius)
+        sketch_engine.SketchDocument.active().save()
         return {'FINISHED'}
 
 
@@ -748,6 +794,7 @@ class EXCAD_OT_sketch_add_line(Operator):
 
     def execute(self, context):
         sketch_engine.SketchDocument.active().add_line(self.u0, self.v0, self.u1, self.v1)
+        sketch_engine.SketchDocument.active().save()
         return {'FINISHED'}
 
 
@@ -758,6 +805,7 @@ class EXCAD_OT_sketch_solve(Operator):
 
     def execute(self, context):
         conv, iters, res = sketch_engine.SketchDocument.active().solve()
+        sketch_engine.SketchDocument.active().save()
         self.report({'INFO'}, f"EX-CAD Solve: {'converged' if conv else 'max iters'} ({iters} iters, res={res:.2e})")
         return {'FINISHED'}
 
@@ -843,6 +891,7 @@ class VIEW3D_PT_excad_human(Panel):
         p = context.scene.excad
         engine_txt = "MPFB2 (MakeHuman Engine)" if human_engine.is_mpfb_available() else "Fallback SDF"
         layout.label(text=f"Engine: {engine_txt}", icon='OUTLINER_OB_ARMATURE')
+        layout.operator("excad.install_cc0_assets", icon="IMPORT")
 
         col = layout.column(align=True)
         col.prop(p, "human_preset")
@@ -949,6 +998,7 @@ class VIEW3D_PT_excad_polyhedron(Panel):
         row.prop(p, "poly_resolution")
         col.prop(p, "poly_dir", text="Folder")
         col.prop(p, "poly_project_color")
+        col.prop(p, "poly_write_depth")
         col.separator()
         row = col.row(align=True)
         row.operator("excad.poly_create_rig", text="1. Camera Rig", icon='OUTLINER_OB_CAMERA')
@@ -1041,6 +1091,7 @@ class VIEW3D_PT_excad_bridge(Panel):
 CLASSES = (
     EXCADSceneProps,
     EXCAD_OT_human_generate,
+    EXCAD_OT_install_cc0_assets,
     EXCAD_OT_human_apply_target,
     EXCAD_OT_human_refit_rig,
     EXCAD_OT_auto_rig_mesh,
@@ -1086,15 +1137,116 @@ def _auto_start_bridge():
 
 
 def register():
+    from . import sketch_overlay
+    sketch_overlay.register()
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.excad = PointerProperty(type=EXCADSceneProps)
-    bpy.app.timers.register(_auto_start_bridge, first_interval=0.5)
+    if not bpy.app.background:
+        bpy.app.timers.register(_auto_start_bridge, first_interval=0.5)
 
 
 def unregister():
+    if bpy.app.timers.is_registered(_auto_start_bridge):
+        bpy.app.timers.unregister(_auto_start_bridge)
+    from . import sketch_overlay
+    sketch_overlay.unregister()
     ai_bridge.AiBridgeServer.instance().stop()
     if hasattr(bpy.types.Scene, "excad"):
         del bpy.types.Scene.excad
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
+
+
+def reload_addon(server):
+    """Replace registered classes and dispatch code while retaining the listening socket."""
+    import importlib
+    import sys
+    from . import sketch_overlay
+
+    modules = (
+        "protocol",
+        "schema",
+        "sketch_profiles",
+        "loft_sections",
+        "sketch_engine",
+        "feature_geometry",
+        "uv_transfer",
+        "feature_tree",
+        "human_engine",
+        "asset_fetcher",
+        "view_fusion",
+        "polyhedron_engine",
+        "view_capture",
+        "image_sketch_engine",
+        "character_stylizer",
+        "face_fit",
+        "human_assets",
+        "hair_contact",
+        "portrait_materials",
+        "wardrobe",
+        "oneshot_generators",
+        "city_generator",
+        "image_colors",
+        "inspect_shading",
+        "inspect_rays",
+        "scene_mesh",
+        "humanoid_skin",
+        "inspection",
+        "uv_bake",
+        "sdf_engine",
+        "ai_3d_provider",
+        "scatter_support",
+        "scene_layout",
+        "appearance",
+        "scene_history",
+        "scene_state",
+        "sketch_overlay",
+        "ai_bridge",
+    )
+    active = hasattr(bpy.types.Scene, "excad")
+    package_name = __name__
+    loaded = [sys.modules[package_name + "." + n] for n in modules if package_name + "." + n in sys.modules]
+    loaded.append(sys.modules[package_name])
+    # Catch syntax errors before touching active operators or RNA properties.
+    from pathlib import Path
+
+    for module in loaded:
+        compile(Path(module.__file__).read_bytes(), module.__file__, "exec")
+    previous = [(module, module.__dict__.copy()) for module in loaded]
+    old_classes, old_properties = CLASSES, EXCADSceneProps
+    removed, added = [], []
+    importlib.invalidate_caches()
+    try:
+        if active:
+            sketch_overlay.unregister()
+            del bpy.types.Scene.excad
+            for cls in reversed(old_classes):
+                bpy.utils.unregister_class(cls)
+                removed.append(cls)
+        for module in loaded:
+            importlib.reload(module)
+        package = sys.modules[package_name]
+        if active:
+            for cls in package.CLASSES:
+                bpy.utils.register_class(cls)
+                added.append(cls)
+            bpy.types.Scene.excad = PointerProperty(type=package.EXCADSceneProps)
+            sketch_overlay.register()
+        server.__class__ = package.ai_bridge.AiBridgeServer
+        package.ai_bridge.AiBridgeServer._instance = server
+        server.history.__class__ = package.ai_bridge.SceneHistory
+    except Exception:
+        if active and hasattr(bpy.types.Scene, "excad"):
+            del bpy.types.Scene.excad
+        for cls in reversed(added):
+            bpy.utils.unregister_class(cls)
+        for module, state in previous:
+            module.__dict__.clear()
+            module.__dict__.update(state)
+        for cls in reversed(removed):
+            bpy.utils.register_class(cls)
+        if active:
+            bpy.types.Scene.excad = PointerProperty(type=old_properties)
+            sketch_overlay.register()
+        raise

@@ -7,8 +7,9 @@ import json
 import socket
 
 
-def rpc(payload: dict, host="127.0.0.1", port=9877, timeout=30.0) -> dict:
-    with socket.create_connection((host, port), timeout=timeout) as s:
+def rpc(payload: dict, host="127.0.0.1", port=9877, timeout=1200.0) -> dict:
+    with socket.create_connection((host, port), timeout=min(timeout, 10.0)) as s:
+        s.settimeout(timeout)
         s.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
         buf = b""
         while not buf.endswith(b"\n"):
